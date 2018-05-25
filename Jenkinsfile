@@ -1,35 +1,56 @@
 stage 'Build'
-node {
-    docker.image('cloudbees/java-build-tools:0.0.7.1').inside {
-        git 'https://github.com/CloudBees-community/MoviePlex-OpenShift-Example.git'
-        sh 'mvn clean package'
-        archive 'target/*.war,target/*.jar'
-    }
+node (''){
+    // these should align to the projects in the Application Inventory
+    env.NAMESPACE = env.OPENSHIFT_BUILD_NAMESPACE.reverse().drop(6).reverse()
+    env.DEV_PROJECT = "${env.NAMESPACE}-dev"
+    env.DEMO_PROJECT = "${env.NAMESPACE}-demo"
+
+    // this value should be set to the root directory of your source code within the git repository.
+    // if the root of the source is the root of the repo, leave this value as ""
+    env.SOURCE_CONTEXT_DIR = ""
+
+    /**
+     these are used to configure which repository maven deploys
+     the ci-cd starter will create a nexus that has this repos available
+     **/
+    env.MVN_SNAPSHOT_DEPLOYMENT_REPOSITORY = "nexus::default::http://nexus:8081/repository/maven-snapshots"
+    env.MVN_RELEASE_DEPLOYMENT_REPOSITORY = "nexus::default::http://nexus:8081/repository/maven-releases"
+
+    // the complete build command
+    // depending on the slave, you may need to wrap this command with scl enable
+    env.BUILD_COMMAND = "mvn clean package dependency-check:check jacoco:report sonar:sonar vertx:package -Dnist.cvedata=http://nexus-rhoar-vertx-ci-cd.apps.s8.core.rht-labs.com/repository/NIST/"
+
+    // these are defaults that will help run openshift automation
+    // DO NOT DELETE THESE - they are required
+    env.OCP_API_SERVER = "${env.OPENSHIFT_API_URL}"
+    env.OCP_TOKEN = readFile('/var/run/secrets/kubernetes.io/serviceaccount/token').trim()
+
+    env.MODULE = "movie-plex"
 }
 
-stage 'Deploy'
-mail to: 'email.adress@domain.com', \
-     subject: "${env.BUILD_TAG} ready to deploy", \
-     body: """Deploy ${env.BUILD_TAG}?
+/**
+ this section of the pipeline executes on a custom mvn build slave.
+ you should not need to change anything below unless you need new stages or new integrations (e.g. Cucumber Reports or Sonar)
+ **/
+node('jenkins-slave-mvn') {
 
-Goto ${env.BUILD_URL}."""
+    stage('SCM Checkout') {
+        checkout scm
+    }
 
+    dir("${env.MODULE}") {
+        stage("Build ${env.MODULE}-app JAR files and perform SonarQube Analysis") {
+            withSonarQubeEnv {
+                sh "${env.BUILD_COMMAND}"
+            }
+            publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: true, reportDir: '/target/', reportFiles: 'dependency-check-report.html', reportName: 'OWASP Dependency Check', reportTitles: 'OWASP Dependency Check'])
+        }
 
-input message: 'Deploy?', ok: 'Deploy'
-node {
-    docker.image('cloudbees/java-build-tools:0.0.7.1').inside {
-        //Requires CloudBees OpenShift CLI Plugin to
-        //automatically install OC client and log in to the server
-        wrap([$class: 'OpenShiftBuildWrapper', 
-                url: 'https://openshift.beesshop.org:8443',
-                credentialsId: 'openshift-admin-aws',
-                insecure: true, //Don't check server certificate
-                ]) {
-                // oc & source2image
-                sh """
-                oc project movieplex-application
-                oc start-build j2ee-application-build
-                """
+        stage("Build ${env.MODULE}-app Image") {
+            def pomVersion = sh(script: 'mvn -Dexec.executable=\'echo\' -Dexec.args=\'${project.version}\' --non-recursive exec:exec -q',
+                    returnStdout: true)
+            sh "oc start-build ${env.MODULE}-app --from-file='target/${env.MODULE}-${pomVersion.trim()}.jar'"
+            openshiftVerifyBuild(buildConfig: "${env.MODULE}-app", waitTime: 5, waitUnit: 'min')
         }
     }
 }
